@@ -1,12 +1,12 @@
 # 0. Обработка ввода CLI от пользователя
 - `flag package`
 - baseUrl with validation
-- port (check if already in use)
+- port with validation
 - error handle
 
 # 1. Работа Web-server'а
 - Запуск веб сервера
-- Запуск на определенном порте
+- Запуск на определенном порте (check if already in use)
 - Обработка входящих запросов
 
 # 2. Разбор и обработка запроса
