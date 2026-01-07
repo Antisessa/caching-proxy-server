@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"caching-proxy-server/internal/cache"
+	"caching-proxy-server/internal/server"
 	"context"
 	"errors"
 	"flag"
@@ -19,88 +22,102 @@ import (
 	"time"
 )
 
-const HTTPClientTimeout = 5
+const DefaultHTTPTimeout = 5
+const DefaultCacheSize = 5
 
-// Check origin url - validate RFC 3986 standard and ping it.
-func checkOrigin(rawURL string) error {
-	u, err := url.ParseRequestURI(rawURL)
+func switchBodyToNopCloser(r *http.Request) error {
+	bodyBytes, err := io.ReadAll(r.Body) // читаем из оригинального body и закрываем дескриптор
+	// r.Body.Close() Не закрываем!, оставляем дескриптор с io.EOF,
+	// после хэндлера body закроется сервером автоматически
+
 	if err != nil {
 		return err
 	}
 
-	if u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("check your scheme or host - one of these is empty")
-	} else if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("invalid schema, only http(-s) is allowed")
-	}
-
-	// Проверка лишь на доступность origin
-	client := http.Client{Timeout: HTTPClientTimeout * time.Second}
-	beforeRequest := time.Now()
-	resp, err := client.Head(u.String())
-	if err != nil {
-		return err
-	}
-	fmt.Println("Success ping", u.String(), "delay to origin - ", time.Since(beforeRequest))
-
-	err = resp.Body.Close()
-	return err
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes)) // подменяем body на NopCloser
+	return nil
 }
 
-func cliInit(port *uint, origin *string, logLevel *string) error {
-	flag.UintVar(port, "port", 0, "specify port that server will listening")
-	flag.StringVar(origin, "origin", "", "origin base url")
-	flag.StringVar(logLevel, "logLevel", "DEBUG", "level for logger")
-	flag.Parse()
-	var err error
+func makeHandler(client *http.Client, cache *cache.Cache, baseUrl url.URL) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("Получен запрос",
+			slog.Group("Request",
+				slog.String("method", r.Method),
+				slog.String("url", r.URL.String()),
+				slog.String("remote", r.RemoteAddr),
+				slog.String("ua", r.UserAgent()),
+			),
+		)
 
-	if *port == 0 {
-		err = fmt.Errorf("error! - port value is incorrect")
-	} else if len(*origin) == 0 {
-		err = fmt.Errorf("error! - origin value is incorrect")
-	} else if len(*logLevel) == 0 {
-		err = fmt.Errorf("error! - log level cannot be empty")
+		err := switchBodyToNopCloser(r)
+		if err != nil {
+			slog.Error("Ошибка при подмене body запроса", slog.String("err", err.Error()))
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		hashedRequest, err := server.Hash(*r)
+		if err != nil {
+			slog.Error("Ошибка при вычислении хэша запроса", slog.String("err", err.Error()))
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		resp, exist := cache.Get(hashedRequest)
+
+		if exist {
+			slog.Info("Ответ взят из кэша")
+		}
+
+		if !exist {
+			targetURL := *r.URL
+			targetURL.Scheme = baseUrl.Scheme
+			targetURL.Host = baseUrl.Host
+
+			bodyBytes, err := io.ReadAll(r.Body)
+			proxyReq, err := http.NewRequest(r.Method, targetURL.String(), bytes.NewReader(bodyBytes))
+			if err != nil {
+				slog.Error("Ошибка при создании прокси-запроса", slog.String("err", err.Error()))
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			// Copy headers from original request
+			proxyReq.Header = r.Header.Clone()
+
+			httpResp, err := client.Do(proxyReq)
+			if err != nil {
+				slog.Error("Ошибка при выполнении запроса", slog.String("err", err.Error()))
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			defer httpResp.Body.Close()
+
+			resp, err = cache.Set(hashedRequest, httpResp)
+			if err != nil {
+				slog.Error("Ошибка при записи значения в кэш", slog.String("err", err.Error()))
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+		}
+
+		// добавляем хэддеры
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+
+		// пишем http статус для ответа
+		w.WriteHeader(resp.StatusCode)
+
+		_, err = w.Write(resp.Body)
+		if err != nil {
+			slog.Error("Cannot write response",
+				"response", resp,
+				"err", err.Error())
+			return
+		}
 	}
-
-	return err
-}
-
-func requestHandler(w http.ResponseWriter, req *http.Request) {
-	slog.Info("Получен запрос",
-		slog.Group("Request",
-			slog.String("method", req.Method),
-			slog.String("url", req.URL.String()),
-			slog.String("remote", req.RemoteAddr),
-			slog.String("ua", req.UserAgent()),
-		),
-	)
-
-	resp := "Hello, world!\n"
-	_, err := io.WriteString(w, resp)
-	if err != nil {
-		slog.Warn("Cannot write response",
-			"response", resp,
-			"err", err.Error())
-		return
-	}
-}
-
-func parseAndSetLogLevel(levelString string, logLevel *slog.LevelVar) error {
-	var err error
-	switch strings.ToUpper(levelString) {
-	case "DEBUG":
-		logLevel.Set(slog.LevelDebug)
-	case "INFO":
-		logLevel.Set(slog.LevelInfo)
-	case "WARN":
-		logLevel.Set(slog.LevelWarn)
-	case "ERROR":
-		logLevel.Set(slog.LevelError)
-	default:
-		err = fmt.Errorf("unknown log level")
-	}
-
-	return err
 }
 
 func main() {
@@ -108,31 +125,14 @@ func main() {
 	var origin string
 	var err error
 	var logLevelString string
+	var cacheSize uint
 
-	err = cliInit(&port, &origin, &logLevelString)
+	err = cliInit(&port, &origin, &logLevelString, &cacheSize)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
 
-	logLevel := &slog.LevelVar{}
-	opts := &slog.HandlerOptions{Level: logLevel}
-	loggerHandler := slog.NewTextHandler(os.Stdout, opts)
-
-	slogger := slog.New(loggerHandler)
-	slogger = slogger.With(
-		slog.Group("server",
-			slog.String("origin", origin),
-			slog.Uint64("port", uint64(port)),
-		),
-	)
-	slog.SetDefault(slogger)
-
-	err = parseAndSetLogLevel(logLevelString, logLevel)
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-
-	err = checkOrigin(origin)
+	logLevel, err := parseLogLevel(logLevelString)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
@@ -147,7 +147,14 @@ func main() {
 	srv := &http.Server{
 		ErrorLog: slog.NewLogLogger(loggerHandler, logLevel.Level()),
 	}
-	http.HandleFunc("/", requestHandler)
+
+	responsesCache := cache.Init(int(cacheSize))
+	httpClient := &http.Client{
+		Timeout: DefaultHTTPTimeout * time.Second,
+	}
+
+	handler := makeHandler(httpClient, responsesCache, parsedUrl)
+	http.HandleFunc("/", handler)
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
@@ -168,5 +175,41 @@ func main() {
 			slog.String("err", err.Error()),
 		)
 	}
-	slog.Debug("Graceful shutdown")
+	slog.Debug("Successful graceful shutdown")
+}
+
+func parseLogLevel(levelString string) (*slog.LevelVar, error) {
+	var err error
+	var res slog.LevelVar
+	switch strings.ToUpper(levelString) {
+	case "DEBUG":
+		res.Set(slog.LevelDebug)
+	case "INFO":
+		res.Set(slog.LevelInfo)
+	case "WARN":
+		res.Set(slog.LevelWarn)
+	case "ERROR":
+		res.Set(slog.LevelError)
+	default:
+		err = fmt.Errorf("unknown log level")
+	}
+
+	return &res, err
+}
+
+func cliInit(port *uint, origin *string, logLevel *string, cacheSize *uint) error {
+	flag.UintVar(port, "port", 0, "specify port that server will listening")
+	flag.StringVar(origin, "origin", "", "origin base url")
+	flag.StringVar(logLevel, "logLevel", "DEBUG", "level for logger")
+	flag.UintVar(cacheSize, "cacheSize", DefaultCacheSize, "size of cache for responses")
+	flag.Parse()
+
+	if *port == 0 {
+		return fmt.Errorf("error! - port value is incorrect")
+	} else if len(*origin) == 0 {
+		return fmt.Errorf("error! - origin value is incorrect")
+	} else if len(*logLevel) == 0 {
+		return fmt.Errorf("error! - log level cannot be empty")
+	}
+	return nil
 }
