@@ -1,11 +1,12 @@
 package app
 
 import (
+	"bytes"
 	"caching-proxy-server/internal/cache"
+	"caching-proxy-server/internal/server"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 )
 
 const CheckOriginTimeout = 5
+const DefaultHTTPTimeout = 5
 
 type App struct {
 	// Поля, получаемые с конструктора
@@ -55,26 +57,42 @@ func (a *App) Run() (*http.Server, error) {
 		return nil, err
 	}
 
-	// TODO перенести это в функцию a.NewServer
+	srv, err := a.newServer()
+	if err != nil {
+		return nil, err
+	}
+
+	httpClient := &http.Client{
+		Timeout: DefaultHTTPTimeout * time.Second,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", makeHandler(httpClient, a.responseCache, *a.url))
+	srv.Handler = mux
+
+	return srv, nil
+}
+
+func (a *App) newServer() (*http.Server, error) {
 	ln, err := net.Listen("tcp", ":"+a.port)
 	if err != nil {
 		return nil, err
 	}
 
 	srv := &http.Server{
-		ErrorLog: slog.NewLogLogger(a.logHandler, a.logLevel.Level()),
+		ErrorLog:          slog.NewLogLogger(a.logHandler, a.logLevel.Level()),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
-	// TODO нужна ли тут горутина?
 	go func() {
-		if err = srv.Serve(ln); err != nil && !errors.Is(http.ErrServerClosed, err) {
-			log.Fatal(err)
+		if serveErr := srv.Serve(ln); serveErr != nil && !errors.Is(http.ErrServerClosed, serveErr) {
+			slog.Error("server serve failed", slog.String("err", serveErr.Error()))
 		}
 	}()
-	// TODO перенести это в функцию a.NewServer
 
-	// TODO Init cache struct
-	// TODO make handler
 	return srv, nil
 }
 
@@ -92,6 +110,87 @@ func (a *App) newLogger() *slog.Logger {
 	)
 
 	return slogger
+}
+
+func makeHandler(client *http.Client, cache *cache.Cache, baseUrl url.URL) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("Получен запрос",
+			slog.Group("Request",
+				slog.String("method", r.Method),
+				slog.String("url", r.URL.String()),
+				slog.String("remote", r.RemoteAddr),
+				slog.String("ua", r.UserAgent()),
+			),
+		)
+
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			slog.Error("Ошибка при чтении body запроса от клиента", slog.String("err", err.Error()))
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		hashedRequest := server.Hash(r.URL.String(), r.Method, r.Header, bodyBytes)
+		slog.Debug("Хэш запись для запроса", slog.String("hash.key", hashedRequest))
+		resp, exist := cache.Get(hashedRequest)
+
+		if exist {
+			slog.Info("Ответ взят из кэша")
+		}
+
+		if !exist {
+			slog.Info("Ответ не найден в кэше")
+			targetURL := *r.URL
+			targetURL.Scheme = baseUrl.Scheme
+			targetURL.Host = baseUrl.Host
+
+			proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), bytes.NewReader(bodyBytes))
+			if err != nil {
+				slog.Error("Ошибка при создании прокси-запроса", slog.String("err", err.Error()))
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+
+			slog.Debug("Построили прокси запрос")
+			// Copy headers from original request
+			proxyReq.Header = r.Header.Clone()
+
+			httpResp, err := client.Do(proxyReq)
+			if err != nil {
+				slog.Error("Ошибка при выполнении запроса", slog.String("err", err.Error()))
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			defer httpResp.Body.Close()
+			slog.Debug("Отправили прокси запрос к origin")
+
+			resp, err = cache.Set(hashedRequest, httpResp)
+			if err != nil {
+				slog.Error("Ошибка при записи значения в кэш", slog.String("err", err.Error()))
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			slog.Debug("Сохранили ответ в кэш")
+		}
+
+		// добавляем хэддеры
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+
+		// пишем http статус для ответа
+		w.WriteHeader(resp.StatusCode)
+
+		_, err = w.Write(resp.Body)
+		if err != nil {
+			slog.Error("Cannot write response",
+				"response", resp,
+				"err", err.Error())
+			return
+		}
+	}
 }
 
 func parseOrigin(rawURL string) (url.URL, error) {
@@ -134,10 +233,10 @@ func (a *App) pingOrigin() error {
 		return fmt.Errorf("origin %q responded with status %s", a.url.String(), resp.Status)
 	}
 
-	slog.Info("Успешный пинг Origin",
-		slog.Group("origin.ping",
-			slog.Duration("Delay", time.Since(beforeRequest)),
-			slog.Int("Status", resp.StatusCode),
+	slog.Info("Успешный пинг origin",
+		slog.Group("server.ping",
+			slog.Duration("delay", time.Since(beforeRequest)),
+			slog.Int("status", resp.StatusCode),
 		),
 	)
 	return err

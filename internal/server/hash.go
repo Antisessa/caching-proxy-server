@@ -1,10 +1,8 @@
 package server
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"io"
 	"net/http"
 )
 
@@ -15,29 +13,19 @@ import (
 //   - Request Body
 //
 // return hash sum as string
-// return error while trying read request body,
-func Hash(r http.Request) (string, error) {
+func Hash(fullOrigin, method string, headers http.Header, bodyBytes []byte) string {
 	hash := sha256.New()
-	hash.Write([]byte(r.URL.String()))
-	hash.Write([]byte(r.Method))
+	hash.Write([]byte(fullOrigin))
+	hash.Write([]byte(method))
 
 	// Headers
-	for header, values := range r.Header {
+	for header, values := range headers {
 		hash.Write([]byte(header))
 		for _, value := range values {
 			hash.Write([]byte(value))
 		}
 	}
 
-	// Body — читаем БЕЗ потребления!
-	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // лимит 1MB
-	if err != nil {
-		return "", err
-	}
-
-	// ВОССТАНАВЛИВАЕМ body!
-	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
 	hash.Write(bodyBytes)
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	return hex.EncodeToString(hash.Sum(nil))
 }

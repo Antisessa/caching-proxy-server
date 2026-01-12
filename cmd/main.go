@@ -1,19 +1,13 @@
 package main
 
 import (
-	"bytes"
+	"caching-proxy-server/app"
 	"caching-proxy-server/internal/cache"
-	"caching-proxy-server/internal/server"
 	"context"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"log/slog"
-	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -22,103 +16,7 @@ import (
 	"time"
 )
 
-const DefaultHTTPTimeout = 5
 const DefaultCacheSize = 5
-
-func switchBodyToNopCloser(r *http.Request) error {
-	bodyBytes, err := io.ReadAll(r.Body) // читаем из оригинального body и закрываем дескриптор
-	// r.Body.Close() Не закрываем!, оставляем дескриптор с io.EOF,
-	// после хэндлера body закроется сервером автоматически
-
-	if err != nil {
-		return err
-	}
-
-	r.Body = io.NopCloser(bytes.NewReader(bodyBytes)) // подменяем body на NopCloser
-	return nil
-}
-
-func makeHandler(client *http.Client, cache *cache.Cache, baseUrl url.URL) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		slog.Info("Получен запрос",
-			slog.Group("Request",
-				slog.String("method", r.Method),
-				slog.String("url", r.URL.String()),
-				slog.String("remote", r.RemoteAddr),
-				slog.String("ua", r.UserAgent()),
-			),
-		)
-
-		err := switchBodyToNopCloser(r)
-		if err != nil {
-			slog.Error("Ошибка при подмене body запроса", slog.String("err", err.Error()))
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-
-		hashedRequest, err := server.Hash(*r)
-		if err != nil {
-			slog.Error("Ошибка при вычислении хэша запроса", slog.String("err", err.Error()))
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-
-		resp, exist := cache.Get(hashedRequest)
-
-		if exist {
-			slog.Info("Ответ взят из кэша")
-		}
-
-		if !exist {
-			targetURL := *r.URL
-			targetURL.Scheme = baseUrl.Scheme
-			targetURL.Host = baseUrl.Host
-
-			bodyBytes, err := io.ReadAll(r.Body)
-			proxyReq, err := http.NewRequest(r.Method, targetURL.String(), bytes.NewReader(bodyBytes))
-			if err != nil {
-				slog.Error("Ошибка при создании прокси-запроса", slog.String("err", err.Error()))
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return
-			}
-			// Copy headers from original request
-			proxyReq.Header = r.Header.Clone()
-
-			httpResp, err := client.Do(proxyReq)
-			if err != nil {
-				slog.Error("Ошибка при выполнении запроса", slog.String("err", err.Error()))
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return
-			}
-			defer httpResp.Body.Close()
-
-			resp, err = cache.Set(hashedRequest, httpResp)
-			if err != nil {
-				slog.Error("Ошибка при записи значения в кэш", slog.String("err", err.Error()))
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return
-			}
-		}
-
-		// добавляем хэддеры
-		for k, vv := range resp.Header {
-			for _, v := range vv {
-				w.Header().Add(k, v)
-			}
-		}
-
-		// пишем http статус для ответа
-		w.WriteHeader(resp.StatusCode)
-
-		_, err = w.Write(resp.Body)
-		if err != nil {
-			slog.Error("Cannot write response",
-				"response", resp,
-				"err", err.Error())
-			return
-		}
-	}
-}
 
 func main() {
 	var port uint
@@ -136,34 +34,17 @@ func main() {
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-
 	portString := strconv.Itoa(int(port))
-
-	ln, err := net.Listen("tcp", ":"+portString)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	srv := &http.Server{
-		ErrorLog: slog.NewLogLogger(loggerHandler, logLevel.Level()),
-	}
-
 	responsesCache := cache.Init(int(cacheSize))
-	httpClient := &http.Client{
-		Timeout: DefaultHTTPTimeout * time.Second,
-	}
 
-	handler := makeHandler(httpClient, responsesCache, parsedUrl)
-	http.HandleFunc("/", handler)
+	newApp := app.NewApp(origin, portString, logLevel, responsesCache)
+	srv, err := newApp.Run()
+	if err != nil {
+		log.Fatal(err.Error())
+	}
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		if err = srv.Serve(ln); err != nil && !errors.Is(http.ErrServerClosed, err) {
-			log.Fatal(err)
-		}
-	}()
 
 	_ = <-c
 	slog.Debug("Received shutdown signal")
